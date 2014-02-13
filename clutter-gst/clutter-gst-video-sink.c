@@ -45,6 +45,7 @@
 #include "clutter-gst-video-sink.h"
 #include "clutter-gst-util.h"
 #include "clutter-gst-private.h"
+#include "clutter-gst-colorbalance-effect.h"
 
 #ifdef CLUTTER_COGL_HAS_GL
 /* include assembly shaders */
@@ -54,6 +55,7 @@
 
 #include <gst/gst.h>
 #include <gst/gstvalue.h>
+#include <gst/video/colorbalance.h>
 #include <gst/video/video.h>
 #include <gst/video/gstvideosink.h>
 #include <gst/video/navigation.h>
@@ -71,6 +73,7 @@
 
 #include <glib.h>
 #include <string.h>
+#include <math.h>
 
 /* Flags to give to cogl_texture_new(). Since clutter 1.1.10 put NO_ATLAS to
  * be sure the frames don't end up in an atlas */
@@ -159,6 +162,10 @@ static GstStaticPadTemplate sinktemplate_all = GST_STATIC_PAD_TEMPLATE ("sink",
 GST_DEBUG_CATEGORY_STATIC (clutter_gst_video_sink_debug);
 #define GST_CAT_DEFAULT clutter_gst_video_sink_debug
 
+#define CLUTTER_GST_CONTRAST_DEFAULT CLUTTER_GST_COLORBALANCE_EFFECT_CONTRAST_DEFAULT
+#define CLUTTER_GST_BRIGHTNESS_DEFAULT CLUTTER_GST_COLORBALANCE_EFFECT_BRIGHTNESS_DEFAULT
+#define CLUTTER_GST_HUE_DEFAULT CLUTTER_GST_COLORBALANCE_EFFECT_HUE_DEFAULT
+#define CLUTTER_GST_SATURATION_DEFAULT CLUTTER_GST_COLORBALANCE_EFFECT_SATURATION_DEFAULT
 
 enum
 {
@@ -254,6 +261,15 @@ struct _ClutterGstVideoSinkPrivate
   gboolean has_crop_meta;
   gboolean crop_meta_has_changed;
 
+  GList *colorbalance_channels;
+
+  gdouble brightness;
+  gdouble contrast;
+  gdouble saturation;
+  gdouble hue;
+  gboolean update_colorbalance;
+  ClutterGstColorbalanceEffect *colorbalance_effect;
+
 #ifdef HAVE_HW_DECODER_SUPPORT
   GstSurfaceConverter *converter;
 
@@ -264,12 +280,17 @@ struct _ClutterGstVideoSinkPrivate
 };
 
 static void
+clutter_gst_colorbalance_interface_init (GstColorBalanceInterface * iface);
+
+static void
 clutter_gst_navigation_interface_init (GstNavigationInterface * iface);
 
 #define clutter_gst_video_sink_parent_class parent_class
 G_DEFINE_TYPE_WITH_CODE (ClutterGstVideoSink, clutter_gst_video_sink,
     GST_TYPE_BASE_SINK, G_IMPLEMENT_INTERFACE (GST_TYPE_NAVIGATION,
-        clutter_gst_navigation_interface_init));
+        clutter_gst_navigation_interface_init);
+    G_IMPLEMENT_INTERFACE (GST_TYPE_COLOR_BALANCE,
+        clutter_gst_colorbalance_interface_init));
 
 static void clutter_gst_video_sink_set_texture (ClutterGstVideoSink * sink,
     ClutterTexture * texture);
@@ -513,6 +534,41 @@ on_stage_allocation_changed (ClutterStage * stage,
   clutter_actor_set_size (CLUTTER_ACTOR (priv->texture), width, height);
 }
 
+static void
+clutter_gst_update_colorbalance (ClutterGstVideoSink * sink)
+{
+  ClutterGstVideoSinkPrivate *priv = sink->priv;
+  ClutterActor *actor = CLUTTER_ACTOR (priv->texture);
+
+  if (priv->update_colorbalance) {
+    clutter_gst_colorbalance_effect_set_value (priv->colorbalance_effect,
+        "CONTRAST", priv->contrast);
+    clutter_gst_colorbalance_effect_set_value (priv->colorbalance_effect,
+        "BRIGHTNESS", priv->brightness);
+    clutter_gst_colorbalance_effect_set_value (priv->colorbalance_effect,
+        "HUE", priv->hue);
+    clutter_gst_colorbalance_effect_set_value (priv->colorbalance_effect,
+        "SATURATION", priv->saturation);
+  }
+
+  if (!clutter_actor_get_effect (actor, "colorbalance")) {
+    if (priv->contrast != CLUTTER_GST_CONTRAST_DEFAULT ||
+        priv->brightness != CLUTTER_GST_BRIGHTNESS_DEFAULT ||
+        priv->hue != CLUTTER_GST_HUE_DEFAULT ||
+        priv->saturation != CLUTTER_GST_SATURATION_DEFAULT) {
+      clutter_actor_add_effect_with_name (actor, "colorbalance",
+          CLUTTER_EFFECT (priv->colorbalance_effect));
+    }
+  } else if (priv->contrast == CLUTTER_GST_CONTRAST_DEFAULT &&
+             priv->brightness == CLUTTER_GST_BRIGHTNESS_DEFAULT &&
+             priv->hue == CLUTTER_GST_HUE_DEFAULT &&
+             priv->saturation == CLUTTER_GST_SATURATION_DEFAULT) {
+    clutter_actor_remove_effect_by_name (actor, "colorbalance");
+  }
+
+  priv->update_colorbalance = FALSE;
+}
+
 static gboolean
 clutter_gst_source_dispatch (GSource * source,
     GSourceFunc callback, gpointer user_data)
@@ -622,6 +678,8 @@ clutter_gst_source_dispatch (GSource * source,
   GST_DEBUG ("buffer:%p", buffer);
 
   g_mutex_unlock (&gst_source->buffer_lock);
+
+  clutter_gst_update_colorbalance (gst_source->sink);
 
   if (buffer) {
     if (!priv->renderer->upload (gst_source->sink, buffer))
@@ -1697,6 +1755,39 @@ navigation_event (ClutterActor * actor,
   return FALSE;
 }
 
+#define CLUTTER_GST_ADD_CHANNEL(name) G_STMT_START { \
+  GstColorBalanceChannel *channel = g_object_new (GST_TYPE_COLOR_BALANCE_CHANNEL, NULL); \
+  channel->label = g_strdup ((name)); \
+  channel->min_value = -1000; \
+  channel->max_value = 1000; \
+  channels = g_list_prepend (channels, channel); \
+  } G_STMT_END
+
+static GList *
+clutter_gst_colorbalance_channel_list_new (void)
+{
+  GList *channels = NULL;
+
+  CLUTTER_GST_ADD_CHANNEL ("BRIGHTNESS");
+  CLUTTER_GST_ADD_CHANNEL ("CONTRAST");
+  CLUTTER_GST_ADD_CHANNEL ("HUE");
+  CLUTTER_GST_ADD_CHANNEL ("SATURATION");
+
+  return channels;
+}
+
+static void
+clutter_gst_colorbalance_channel_list_free (GList *channels)
+{
+  GList *channel;
+
+  for (channel = channels; channel != NULL; channel = channel->next) {
+    GstColorBalanceChannel *data = channel->data;
+    g_object_unref (data);
+  }
+  g_list_free (channels);
+}
+
 static void
 clutter_gst_video_sink_init (ClutterGstVideoSink * sink)
 {
@@ -1715,6 +1806,15 @@ clutter_gst_video_sink_init (ClutterGstVideoSink * sink)
 
   priv->signal_handler_ids = g_array_new (FALSE, TRUE, sizeof (gulong));
   priv->priority = CLUTTER_GST_DEFAULT_PRIORITY;
+
+  priv->colorbalance_channels = clutter_gst_colorbalance_channel_list_new ();
+
+  priv->brightness = CLUTTER_GST_BRIGHTNESS_DEFAULT;
+  priv->contrast = CLUTTER_GST_CONTRAST_DEFAULT;
+  priv->saturation = CLUTTER_GST_SATURATION_DEFAULT;
+  priv->hue = CLUTTER_GST_HUE_DEFAULT;
+
+  priv->colorbalance_effect = g_object_ref (clutter_gst_colorbalance_effect_new ());
 }
 
 static GstFlowReturn
@@ -1819,6 +1919,14 @@ clutter_gst_video_sink_dispose (GObject * object)
   if (priv->caps) {
     gst_caps_unref (priv->caps);
     priv->caps = NULL;
+  }
+
+  clutter_gst_colorbalance_channel_list_free (priv->colorbalance_channels);
+  priv->colorbalance_channels = NULL;
+
+  if (priv->colorbalance_effect) {
+    g_object_unref (priv->colorbalance_effect);
+    priv->colorbalance_effect = NULL;
   }
 
   G_OBJECT_CLASS (parent_class)->dispose (object);
@@ -2085,6 +2193,88 @@ static void
 clutter_gst_navigation_interface_init (GstNavigationInterface * iface)
 {
   iface->send_event = clutter_gst_navigation_send_event;
+}
+
+static GstColorBalanceType
+clutter_gst_colorbalance_get_balance_type (GstColorBalance * balance)
+{
+  return GST_COLOR_BALANCE_HARDWARE;
+}
+
+static const GList *
+clutter_gst_colorbalance_list_channels (GstColorBalance * balance)
+{
+  ClutterGstVideoSink *videosink = CLUTTER_GST_VIDEO_SINK (balance);
+  ClutterGstVideoSinkPrivate *priv = videosink->priv;
+
+  return priv->colorbalance_channels;
+}
+
+static void
+clutter_gst_colorbalance_set_value (GstColorBalance * balance,
+    GstColorBalanceChannel * channel, gint value)
+{
+  ClutterGstVideoSink *videosink = CLUTTER_GST_VIDEO_SINK (balance);
+  ClutterGstVideoSinkPrivate *priv = videosink->priv;
+  gdouble new_val;
+
+  g_return_if_fail (channel->label != NULL);
+
+  GST_DEBUG_OBJECT (videosink, "Setting %s channel to %d",
+      channel->label, value);
+
+  if (g_ascii_strcasecmp (channel->label, "CONTRAST") == 0) {
+    new_val = (value + 1000) * 2.0 / 2000.0;
+    priv->update_colorbalance |= new_val != priv->contrast;
+    priv->contrast = new_val;
+  } else if (g_ascii_strcasecmp (channel->label, "BRIGHTNESS") == 0) {
+    new_val = (value + 1000) * 2.0 / 2000.0 - 1.0;
+    priv->update_colorbalance |= new_val != priv->brightness;
+    priv->brightness = new_val;
+  } else if (g_ascii_strcasecmp (channel->label, "HUE") == 0) {
+    new_val = (value + 1000) * 2.0 / 2000.0 - 1.0;
+    priv->update_colorbalance |= new_val != priv->hue;
+    priv->hue = new_val;
+  } else if (g_ascii_strcasecmp (channel->label, "SATURATION") == 0) {
+    new_val = (value + 1000) * 2.0 / 2000.0;
+    priv->update_colorbalance |= new_val != priv->saturation;
+    priv->saturation = new_val;
+  } else {
+    GST_ERROR ("Unsupported color balance channel %s", channel->label);
+    return;
+  }
+}
+
+static gint
+clutter_gst_colorbalance_get_value (GstColorBalance * balance,
+    GstColorBalanceChannel * channel)
+{
+  ClutterGstVideoSink *videosink = CLUTTER_GST_VIDEO_SINK (balance);
+  ClutterGstVideoSinkPrivate *priv = videosink->priv;
+  gint value = 0;
+
+  g_return_val_if_fail (channel->label != NULL, 0);
+
+  if (g_ascii_strcasecmp (channel->label, "CONTRAST") == 0) {
+    value = priv->contrast * 2000 / 2.0 - 1000;
+  } else if (g_ascii_strcasecmp (channel->label, "BRIGHTNESS") == 0) {
+    value = (priv->brightness + 1) * 2000 / 2.0 - 1000;
+  } else if (g_ascii_strcasecmp (channel->label, "HUE") == 0) {
+    value = (priv->hue + 1) * 2000 / 2.0 - 1000;
+  } else if (g_ascii_strcasecmp (channel->label, "SATURATION") == 0) {
+    value = priv->saturation * 2000 / 2.0 - 1000;
+  }
+
+  return value;
+}
+
+static void
+clutter_gst_colorbalance_interface_init (GstColorBalanceInterface * iface)
+{
+  iface->list_channels = clutter_gst_colorbalance_list_channels;
+  iface->set_value = clutter_gst_colorbalance_set_value;
+  iface->get_value = clutter_gst_colorbalance_get_value;
+  iface->get_balance_type = clutter_gst_colorbalance_get_balance_type;
 }
 
 gboolean
