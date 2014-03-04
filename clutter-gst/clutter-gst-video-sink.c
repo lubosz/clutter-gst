@@ -46,6 +46,7 @@
 #include "clutter-gst-util.h"
 #include "clutter-gst-private.h"
 #include "clutter-gst-colorbalance-effect.h"
+#include "clutter-gst-overlay-effect.h"
 
 #ifdef CLUTTER_COGL_HAS_GL
 /* include assembly shaders */
@@ -269,6 +270,8 @@ struct _ClutterGstVideoSinkPrivate
   gdouble hue;
   gboolean update_colorbalance;
   ClutterGstColorbalanceEffect *colorbalance_effect;
+
+  ClutterGstOverlayEffect *overlay_effect;
 
 #ifdef HAVE_HW_DECODER_SUPPORT
   GstSurfaceConverter *converter;
@@ -570,6 +573,72 @@ clutter_gst_update_colorbalance (ClutterGstVideoSink * sink)
 }
 
 static gboolean
+clutter_gst_update_overlay (ClutterGstVideoSink * sink, GstBuffer * buffer)
+{
+  ClutterGstVideoSinkPrivate *priv = sink->priv;
+  GstVideoOverlayComposition *composition = NULL;
+  GstVideoOverlayCompositionMeta *composition_meta = NULL;
+  ClutterActor *actor = CLUTTER_ACTOR (priv->texture);
+  gint i, nb_rectangle;
+
+  if (!buffer) {
+    clutter_actor_remove_effect_by_name (actor, "overlay");
+    return FALSE;
+  }
+
+  composition_meta = gst_buffer_get_video_overlay_composition_meta (buffer);
+  if (!composition_meta) {
+    clutter_actor_remove_effect_by_name (actor, "overlay");
+    return FALSE;
+  }
+
+  clutter_gst_overlay_effect_reset_overlays (priv->overlay_effect);
+  clutter_gst_overlay_effect_set_source_size (priv->overlay_effect,
+      priv->info.width, priv->info.height);
+  if (!clutter_actor_get_effect (actor, "overlay"))
+    clutter_actor_add_effect_with_name (actor, "overlay",
+        CLUTTER_EFFECT (priv->overlay_effect));
+
+  composition = composition_meta->overlay;
+  nb_rectangle = gst_video_overlay_composition_n_rectangles (composition);
+  for (i = 0; i < nb_rectangle; i++) {
+    GstMapInfo info;
+    GstVideoMeta *vmeta;
+    GstBuffer *comp_buffer;
+    GstVideoOverlayRectangle *rectangle;
+    gpointer data;
+    CoglTexture *tex;
+
+    gint comp_x, comp_y, stride;
+    guint comp_width, comp_height;
+
+    rectangle = gst_video_overlay_composition_get_rectangle (composition, i);
+    comp_buffer =
+        gst_video_overlay_rectangle_get_pixels_unscaled_argb (rectangle,
+        GST_VIDEO_OVERLAY_FORMAT_FLAG_PREMULTIPLIED_ALPHA);
+
+    gst_video_overlay_rectangle_get_render_rectangle (rectangle,
+        &comp_x, &comp_y, &comp_width, &comp_height);
+
+    vmeta = gst_buffer_get_video_meta (comp_buffer);
+    gst_video_meta_map (vmeta, 0, &info, &data, &stride, GST_MAP_READ);
+
+    tex =
+        cogl_texture_new_from_data (comp_width,
+        comp_height,
+        CLUTTER_GST_TEXTURE_FLAGS,
+        COGL_PIXEL_FORMAT_BGRA_8888, COGL_PIXEL_FORMAT_BGRA_8888, stride, data);
+
+    gst_video_meta_unmap (vmeta, 0, &info);
+    clutter_gst_overlay_effect_add_overlay (priv->overlay_effect, comp_x,
+        comp_y, comp_width, comp_height, tex);
+    cogl_object_unref (tex);
+  }
+
+  return TRUE;
+}
+
+static gboolean
 clutter_gst_source_dispatch (GSource * source,
     GSourceFunc callback, gpointer user_data)
 {
@@ -680,6 +749,7 @@ clutter_gst_source_dispatch (GSource * source,
   g_mutex_unlock (&gst_source->buffer_lock);
 
   clutter_gst_update_colorbalance (gst_source->sink);
+  clutter_gst_update_overlay (gst_source->sink, buffer);
 
   if (buffer) {
     if (!priv->renderer->upload (gst_source->sink, buffer))
@@ -1815,6 +1885,7 @@ clutter_gst_video_sink_init (ClutterGstVideoSink * sink)
   priv->hue = CLUTTER_GST_HUE_DEFAULT;
 
   priv->colorbalance_effect = g_object_ref (clutter_gst_colorbalance_effect_new ());
+  priv->overlay_effect = g_object_ref (clutter_gst_overlay_effect_new ());
 }
 
 static GstFlowReturn
@@ -1927,6 +1998,11 @@ clutter_gst_video_sink_dispose (GObject * object)
   if (priv->colorbalance_effect) {
     g_object_unref (priv->colorbalance_effect);
     priv->colorbalance_effect = NULL;
+  }
+
+  if (priv->overlay_effect) {
+    g_object_unref (priv->overlay_effect);
+    priv->overlay_effect = NULL;
   }
 
   G_OBJECT_CLASS (parent_class)->dispose (object);
@@ -2075,6 +2151,9 @@ clutter_gst_video_sink_propose_allocation (GstBaseSink * base_sink, GstQuery * q
 
   gst_query_add_allocation_meta (query,
       GST_VIDEO_GL_TEXTURE_UPLOAD_META_API_TYPE, NULL);
+
+  gst_query_add_allocation_meta (query,
+      GST_VIDEO_OVERLAY_COMPOSITION_META_API_TYPE, NULL);
 
   return TRUE;
 }

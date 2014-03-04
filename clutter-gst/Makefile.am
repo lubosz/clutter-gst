@@ -29,6 +29,7 @@ source_h = 					\
 	$(srcdir)/clutter-gst-video-texture.h 	\
 	$(srcdir)/clutter-gst-player.h		\
 	$(srcdir)/clutter-gst-colorbalance-effect.h	\
+	$(srcdir)/clutter-gst-overlay-effect.h	\
 	$(NULL)
 
 source_priv_h =					\
@@ -45,6 +46,7 @@ source_c = 					\
 	$(srcdir)/clutter-gst-video-texture.c	\
         $(srcdir)/clutter-gst-util.c		\
     $(srcdir)/clutter-gst-colorbalance-effect.c	\
+	$(srcdir)/clutter-gst-overlay-effect.c	\
 	$(glib_enum_c)				\
 	$(NULL)
 
@@ -103,6 +105,8 @@ plugin_source_c = 				\
 	$(srcdir)/clutter-gst-auto-video-sink.h	\
 	$(srcdir)/clutter-gst-colorbalance-effect.c\
 	$(srcdir)/clutter-gst-colorbalance-effect.h\
+	$(srcdir)/clutter-gst-overlay-effect.c\
+	$(srcdir)/clutter-gst-overlay-effect.h\
 	$(NULL)
 
 libgstclutter_la_SOURCES =	\
